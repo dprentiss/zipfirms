@@ -2,12 +2,15 @@
 #include <curand.h>
 #include <curand_kernel.h>
 
-static const unsigned int NUM_AGENTS = 1 << 15;
+static const unsigned int NUM_AGENTS = 1 << 18;
+//static const unsigned int NUM_AGENTS = 2000000;
 static const unsigned int NUM_FIRMS = 1 << 10;
-static const unsigned int NUM_ITER = 1 << 20;
+//static const unsigned int NUM_FIRMS = 10000;
+static const unsigned int NUM_ITER = 1 << 11;
+//static const unsigned int NUM_ITER = 10000;
 
-static const float Q = 0.2;
-static const float BIAS = 0.6;
+static const float Q = 0.5;
+static const float BIAS = 0.4;
 static const float P = Q + BIAS;
 static const int THREADS_PER_BLOCK = 1 << 10;
 static const int NUM_BLOCKS = ceil(NUM_AGENTS / THREADS_PER_BLOCK);
@@ -22,48 +25,64 @@ void init(unsigned int *firms, unsigned int *agents, curandState *states, unsign
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
     if (idx < NUM_AGENTS) {
+        curandState state;
 
         // init random states
-        curand_init(seed, (unsigned long long)idx, 0, &states[idx]);
+        curand_init(seed, (unsigned long long)idx, 0, &state);
 
         // randomly select an initial firm for agent
-        agents[idx] = curand(&states[idx]) % NUM_FIRMS;
+        agents[idx] = curand(&state) % NUM_FIRMS;
 
         // tally agents assigned to firms
         atomicAdd(&firms[agents[idx]], 1);
+
+        // copy local state to global state array
+        states[idx] = state;
     }
 }
 
     __global__
-void flow(unsigned int *firms, unsigned int *agents, curandState *states, unsigned int N)
+void move(unsigned int *firms, unsigned int *agents, curandState *states, unsigned int N)
 {
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    __shared__ int s_firms[NUM_FIRMS];
 
     if (idx < NUM_AGENTS) {
+
         curandState state = states[idx];
         unsigned int firm = agents[idx];
         unsigned int firmSize = firms[firm];
         unsigned int newFirm;
+        unsigned int newFirmSize;
         float p;
 
         for (int i = 0; i < N; i++) {
+            // reset local tally to 0
+            for (int j = threadIdx.x; j < NUM_FIRMS; j += blockDim.x) {
+                s_firms[j] = 0;
+            }
+            __syncthreads();
             // randomly select another firm
             newFirm = curand(&state) % NUM_FIRMS;
+            newFirmSize = firms[newFirm];
             // compare firms to get probabiliy of moving
-            p = firms[newFirm] > firmSize ? P : Q;
+            p = newFirmSize > firmSize ? P : Q;
             if (curand_uniform(&state) < p) { // if moving
-                // decrement tally at old firm
-                atomicSub(&firms[firm], 1);
+                // decrement local tally at old firm
+                atomicSub(&s_firms[firm], 1);
                 firm = newFirm;
-                // increment tally at new firm and save old tally
-                firmSize = atomicAdd(&firms[firm], 1);
-                // increment local tally
-                firmSize++;
+                firmSize = newFirmSize;
+                // increment local tally at new firm
+                atomicAdd(&s_firms[firm], 1);
             }
+            __syncthreads();
+            for (int j =  threadIdx.x; j < NUM_FIRMS; j += blockDim.x) {
+                atomicAdd(&firms[j], s_firms[j]);
+            }
+            __syncthreads();
         }
         agents[idx] = firm;
         states[idx] = state;
-
     }
 }
 
@@ -92,7 +111,6 @@ int main()
     cudaMallocManaged(&states, stateSize);
 
     init<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, agents, states, seed);
-
     cudaDeviceSynchronize();
 
     for (int i = 0; i < NUM_FIRMS; i++) {
@@ -105,10 +123,8 @@ int main()
     }
     //printf("%d\n", sum);
 
-    for (int i = 0; i < 1; i++) {
-        flow<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, agents, states, NUM_ITER);
-    }
-
+    for (int i = 0; i < 1 ; i++) {
+        move<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, agents, states, NUM_ITER);
     cudaDeviceSynchronize();
 
     for (int i = 0; i < NUM_FIRMS; i++) {
@@ -121,6 +137,7 @@ int main()
         sum += firms[i];
     }
     printf("Agent Count: %d\n", sum);
+    }
 
     // free memory
     cudaFree(firms);
