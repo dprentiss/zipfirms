@@ -2,25 +2,27 @@
 #include <curand.h>
 #include <curand_kernel.h>
 
-static const unsigned int NUM_AGENTS = 1 << 18;
+static const unsigned int NUM_AGENTS = 1 << 14;
 //static const unsigned int NUM_AGENTS = 2000000;
-static const unsigned int NUM_FIRMS = 1 << 10;
+static const unsigned int NUM_FIRMS = 1 << 6;
 //static const unsigned int NUM_FIRMS = 10000;
-static const unsigned int NUM_ITER = 1 << 11;
+static const unsigned int NUM_ITER = 1 << 0;
 //static const unsigned int NUM_ITER = 10000;
 
 static const float Q = 0.5;
-static const float BIAS = 0.4;
+static const float BIAS = 0.5;
 static const float P = Q + BIAS;
 static const int THREADS_PER_BLOCK = 1 << 10;
 static const int NUM_BLOCKS = ceil(NUM_AGENTS / THREADS_PER_BLOCK);
 
 unsigned int *firms;
+unsigned int *firms_tmp;
 unsigned int *agents;
 curandState *states;
 
     __global__
-void init(unsigned int *firms, unsigned int *agents, curandState *states, unsigned long seed)
+void init(unsigned int *firms, unsigned int *firms_tmp,
+        unsigned int *agents, curandState *states, unsigned long seed)
 {
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -34,7 +36,7 @@ void init(unsigned int *firms, unsigned int *agents, curandState *states, unsign
         agents[idx] = curand(&state) % NUM_FIRMS;
 
         // tally agents assigned to firms
-        atomicAdd(&firms[agents[idx]], 1);
+        atomicAdd(&firms_tmp[agents[idx]], 1);
 
         // copy local state to global state array
         states[idx] = state;
@@ -42,7 +44,8 @@ void init(unsigned int *firms, unsigned int *agents, curandState *states, unsign
 }
 
     __global__
-void move(unsigned int *firms, unsigned int *agents, curandState *states, unsigned int N)
+void move(unsigned int *firms, unsigned int *firms_tmp,
+        unsigned int *agents, curandState *states, unsigned int N)
 {
     unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
     __shared__ int s_firms[NUM_FIRMS];
@@ -77,7 +80,7 @@ void move(unsigned int *firms, unsigned int *agents, curandState *states, unsign
             }
             __syncthreads();
             for (int j =  threadIdx.x; j < NUM_FIRMS; j += blockDim.x) {
-                atomicAdd(&firms[j], s_firms[j]);
+                atomicAdd(&firms_tmp[j], s_firms[j]);
             }
             __syncthreads();
         }
@@ -107,11 +110,17 @@ int main()
     // allocate memeory
     // TODO implement error handling
     cudaMallocManaged(&firms, firmSize);
+    cudaMallocManaged(&firms_tmp, firmSize);
     cudaMallocManaged(&agents, agentSize);
     cudaMallocManaged(&states, stateSize);
 
-    init<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, agents, states, seed);
+    init<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, firms_tmp, agents, states, seed);
     cudaDeviceSynchronize();
+
+    // copy firms_tmp to firms
+    for (int i = 0; i < NUM_FIRMS; i++) {
+        firms[i] = firms_tmp[i];
+    }
 
     for (int i = 0; i < NUM_FIRMS; i++) {
         printf("%5u", firms[i]);
@@ -123,9 +132,29 @@ int main()
     }
     //printf("%d\n", sum);
 
-    for (int i = 0; i < 1 ; i++) {
-        move<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, agents, states, NUM_ITER);
-    cudaDeviceSynchronize();
+    // outer loop
+    for (int i = 0; i < 100000 ; i++) {
+        move<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(firms, firms_tmp, agents, states, NUM_ITER);
+        cudaDeviceSynchronize();
+
+        // copy firms_tmp to firms
+        for (int i = 0; i < NUM_FIRMS; i++) {
+            firms[i] = firms_tmp[i];
+        }
+
+        /*
+        for (int i = 0; i < NUM_FIRMS; i++) {
+            printf("%5u", firms[i]);
+        }
+        printf("\n");
+        printf("\n");
+        sum = 0;
+        for (int i = 0; i < NUM_FIRMS; i++) {
+            sum += firms[i];
+        }
+        printf("Agent Count: %d\n", sum);
+        */
+    }
 
     for (int i = 0; i < NUM_FIRMS; i++) {
         printf("%5u", firms[i]);
@@ -137,7 +166,6 @@ int main()
         sum += firms[i];
     }
     printf("Agent Count: %d\n", sum);
-    }
 
     // free memory
     cudaFree(firms);
